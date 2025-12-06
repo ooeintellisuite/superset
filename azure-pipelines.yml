@@ -28,7 +28,9 @@ stages:
       - job: BuildAndPush
         displayName: 'Build and Push'
         pool:
-          name: Default
+          name: 'Linux-Hosted'
+          demands:
+            - Agent.Name -equals ubuntu-vm-3
         
         steps:
           # Checkout code
