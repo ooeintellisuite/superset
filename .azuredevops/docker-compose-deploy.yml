@@ -18,28 +18,6 @@ services:
       timeout: 5s
       retries: 5
 
-  db:
-    image: postgres:17.4
-    container_name: superset_db
-    shm_size: 1g
-    user: postgres
-    restart: unless-stopped
-    networks:
-      - superset-network
-    environment:
-      # Metadata DB credentials (internal to Superset)
-      POSTGRES_USER: superset
-      POSTGRES_PASSWORD: superset
-      POSTGRES_DB: superset
-    volumes:
-      - db_home:/var/lib/postgresql/data
-      - ${DOCKER_INITDB_DIR:-./docker/docker-entrypoint-initdb.d}:/docker-entrypoint-initdb.d
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U superset --dbname=superset"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
   superset-init:
     image: ${SUPERSET_IMAGE:?SUPERSET_IMAGE environment variable is not set or empty}
     container_name: superset_init
@@ -123,5 +101,4 @@ networks:
 
 volumes:
   superset_home:
-  db_home:
   redis:
