@@ -306,6 +306,23 @@ stages:
                     Write-Host "=== Config rehydration completed ==="
 
               # -------------------------------------
+              # Database Initialization (Unified for brownfield & greenfield)
+              # -------------------------------------
+              - bash: |
+                  echo "=== Database Initialization ==="
+                  echo "This step ensures superset_meta database exists for both scenarios:"
+                  echo "  - Brownfield: Migrates data from existing superset_db"
+                  echo "  - Greenfield: Creates empty database for fresh deployment"
+                  echo ""
+
+                  # Run the unified initialization script
+                  bash .azuredevops/scripts/initialize-database.sh
+
+                  echo ""
+                  echo "=== Database Initialization Complete ==="
+                displayName: 'Initialize Database'
+
+              # -------------------------------------
               # Load deployment artifact
               # -------------------------------------
               - bash: |
