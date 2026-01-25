@@ -30,14 +30,14 @@ services:
       # Superset configuration
       SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:?SUPERSET_SECRET_KEY environment variable is not set or empty}
 
-      # Metadata database (internal PostgreSQL)
+      # Metadata database (consolidated into oee-postgres)
       # These must be set as environment variables for superset_config.py
       DATABASE_DIALECT: postgresql
-      DATABASE_USER: superset
-      DATABASE_PASSWORD: superset
-      DATABASE_HOST: db
+      DATABASE_USER: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_HOST: oee-postgres
       DATABASE_PORT: "5432"
-      DATABASE_DB: superset
+      DATABASE_DB: superset_meta
 
       # Redis
       REDIS_HOST: redis
@@ -49,8 +49,6 @@ services:
       SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD:?SUPERSET_ADMIN_PASSWORD is required}
     depends_on:
       redis:
-        condition: service_healthy
-      db:
         condition: service_healthy
     volumes: *superset-volumes
     healthcheck:
@@ -71,14 +69,14 @@ services:
       # Superset configuration
       SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:?SUPERSET_SECRET_KEY environment variable is not set or empty}
 
-      # Metadata database (internal PostgreSQL)
+      # Metadata database (consolidated into oee-postgres)
       # These must be set as environment variables for superset_config.py
       DATABASE_DIALECT: postgresql
-      DATABASE_USER: superset
-      DATABASE_PASSWORD: superset
-      DATABASE_HOST: db
+      DATABASE_USER: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_HOST: oee-postgres
       DATABASE_PORT: "5432"
-      DATABASE_DB: superset
+      DATABASE_DB: superset_meta
 
       # Redis
       REDIS_HOST: redis

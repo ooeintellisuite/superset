@@ -380,11 +380,11 @@ stages:
 
                   # Database configuration (for superset_config.py)
                   DATABASE_DIALECT=postgresql
-                  DATABASE_USER=superset
-                  DATABASE_PASSWORD=superset
-                  DATABASE_HOST=db
+                  DATABASE_USER=postgres
+                  DATABASE_PASSWORD=postgres
+                  DATABASE_HOST=oee-postgres
                   DATABASE_PORT=5432
-                  DATABASE_DB=superset
+                  DATABASE_DB=superset_meta
 
                   # Redis configuration
                   REDIS_HOST=redis
@@ -403,10 +403,10 @@ stages:
                   echo "  SUPERSET_IMAGE: ${FULL_IMAGE_NAME}"
                   echo "  SUPERSET_PORT: ${SUPERSET_PORT}"
                   echo "  DATABASE_DIALECT: postgresql"
-                  echo "  DATABASE_USER: superset"
-                  echo "  DATABASE_HOST: db"
+                  echo "  DATABASE_USER: postgres"
+                  echo "  DATABASE_HOST: oee-postgres"
                   echo "  DATABASE_PORT: 5432"
-                  echo "  DATABASE_DB: superset"
+                  echo "  DATABASE_DB: superset_meta"
                   echo "  REDIS_HOST: redis"
                   echo "  REDIS_PORT: 6379"
                   echo "  DOCKER_NETWORK: ${DOCKER_NETWORK}"
