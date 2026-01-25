@@ -137,3 +137,6 @@ PROJECT.md
 .claude_rc*
 .env.local
 oxc-custom-build/
+
+# Security: Don't commit plan documentation (may contain sensitive examples)
+docs/plans/
