@@ -137,3 +137,6 @@ PROJECT.md
 oxc-custom-build/
 *.code-workspace
 *.duckdb
+
+# Security: Don't commit plan documentation (may contain sensitive examples)
+docs/plans/
