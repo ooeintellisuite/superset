@@ -70,6 +70,7 @@ import {
   EchartsHeatmapChartPlugin,
   EchartsGanttChartPlugin,
 } from '@superset-ui/plugin-chart-echarts';
+import { ParetoChartPlugin } from '@superset-ui/plugin-chart-pareto';
 import {
   SelectFilterPlugin,
   RangeFilterPlugin,
@@ -103,6 +104,7 @@ export default class MainPreset extends Preset {
       name: 'Legacy charts',
       presets: [new DeckGLChartPreset()],
       plugins: [
+        new ParetoChartPlugin().configure({ key: VizType.Pareto }),
         new BigNumberChartPlugin().configure({ key: VizType.BigNumber }),
         new BigNumberTotalChartPlugin().configure({
           key: VizType.BigNumberTotal,

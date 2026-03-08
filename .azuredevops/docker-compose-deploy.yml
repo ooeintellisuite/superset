@@ -21,9 +21,7 @@ services:
   db:
     image: postgres:17.4
     container_name: superset_db
-    env_file:
-      - .env.deploy
-    shm_size: 1g
+    shm_size: 4g
     user: postgres
     restart: unless-stopped
     networks:
@@ -33,9 +31,25 @@ services:
       POSTGRES_USER: superset
       POSTGRES_PASSWORD: superset
       POSTGRES_DB: superset
+      # Reduce PostgreSQL shared memory usage to prevent "No space left on device" errors
+      # work_mem: memory for sorting/hashing (default 4MB, reduced to 1MB)
+      # maintenance_work_mem: memory for maintenance operations (default 64MB, reduced to 16MB)
+      POSTGRES_HOST_AUTH_METHOD: trust
+    command:
+      - postgres
+      - -c
+      - work_mem=1MB
+      - -c
+      - maintenance_work_mem=16MB
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - effective_cache_size=256MB
+      - -c
+      - huge_pages=off
     volumes:
       - db_home:/var/lib/postgresql/data
-      - ./docker/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
+      - ${DOCKER_INITDB_DIR:-./docker/docker-entrypoint-initdb.d}:/docker-entrypoint-initdb.d
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U superset --dbname=superset"]
       interval: 10s
@@ -43,30 +57,34 @@ services:
       retries: 5
 
   superset-init:
-    image: ${SUPERSET_IMAGE}
+    image: ${SUPERSET_IMAGE:?SUPERSET_IMAGE environment variable is not set or empty}
     container_name: superset_init
     command: ["/app/docker/docker-init.sh"]
     user: "root"
     networks:
       - superset-network
       - oeeintellisuite
-    env_file:
-      - .env.deploy
     environment:
       # Superset configuration
-      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
-      
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:?SUPERSET_SECRET_KEY environment variable is not set or empty}
+
       # Metadata database (internal PostgreSQL)
-      DATABASE_DB: superset
-      DATABASE_HOST: db
-      DATABASE_PASSWORD: superset
-      DATABASE_USER: superset
-      DATABASE_PORT: 5432
+      # These must be set as environment variables for superset_config.py
       DATABASE_DIALECT: postgresql
-      
+      DATABASE_USER: superset
+      DATABASE_PASSWORD: superset
+      DATABASE_HOST: db
+      DATABASE_PORT: "5432"
+      DATABASE_DB: superset
+
       # Redis
       REDIS_HOST: redis
-      REDIS_PORT: 6379
+      REDIS_PORT: "6379"
+      # Webserver port - must match container port mapping
+      SUPERSET_PORT: "5760"
+      # Superset admin credentials (from blue-dev secret)
+      SUPERSET_ADMIN_USER: ${SUPERSET_ADMIN_USER:?SUPERSET_ADMIN_USER is required}
+      SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD:?SUPERSET_ADMIN_PASSWORD is required}
     depends_on:
       redis:
         condition: service_healthy
@@ -77,7 +95,7 @@ services:
       disable: true
 
   superset:
-    image: ${SUPERSET_IMAGE}
+    image: ${SUPERSET_IMAGE:?SUPERSET_IMAGE environment variable is not set or empty}
     container_name: superset_app
     command: ["/app/docker/docker-bootstrap.sh", "app-gunicorn"]
     user: "root"
@@ -87,24 +105,25 @@ services:
       - oeeintellisuite
     ports:
       - "${SUPERSET_PORT:-5760}:5760"
-    env_file:
-      - .env.deploy
     environment:
       # Superset configuration
-      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
-      
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:?SUPERSET_SECRET_KEY environment variable is not set or empty}
+
       # Metadata database (internal PostgreSQL)
-      DATABASE_DB: superset
-      DATABASE_HOST: db
-      DATABASE_PASSWORD: superset
-      DATABASE_USER: superset
-      DATABASE_PORT: 5432
+      # These must be set as environment variables for superset_config.py
       DATABASE_DIALECT: postgresql
-      
+      DATABASE_USER: superset
+      DATABASE_PASSWORD: superset
+      DATABASE_HOST: db
+      DATABASE_PORT: "5432"
+      DATABASE_DB: superset
+
       # Redis
       REDIS_HOST: redis
       REDIS_PORT: "6379"
-      
+      # Webserver port - must match container port mapping
+      SUPERSET_PORT: "5760"
+
     depends_on:
       superset-init:
         condition: service_completed_successfully

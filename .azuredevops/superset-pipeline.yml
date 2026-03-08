@@ -11,6 +11,14 @@ parameters:
     displayName: Docker Agent Pool
     default: 'Linux-Hosted'
 
+  - name: cleanBuild
+    type: boolean
+    default: false
+    displayName: 'Clean Build (Disable Cache)'
+
+  # SECRET_KEY is now sourced from blue-dev secret (client-config JSON)
+  # Removed hardcoded pipeline parameter - using centralized secret management
+
 variables:
   appName: superset
   containerRegistry: 'IntelliSuite Container Registry'
@@ -18,7 +26,16 @@ variables:
   imageRepository: 'superset'
   dockerfilePath: '$(Build.SourcesDirectory)/Dockerfile'
   artifactName: superset-deployment
-  vmImageName: 'ubuntu-latest'
+
+  # Conditionally disable cache based on cleanBuild parameter
+  system.cacheDisabled: ${{ parameters.cleanBuild }}
+
+  # Conditionally pass --no-cache to Docker build when cleanBuild=true
+  # This ensures Docker layer cache and npm cache are disabled
+  ${{ if eq(parameters.cleanBuild, true) }}:
+    dockerBuildArgs: --no-cache
+  ${{ else }}:
+    dockerBuildArgs: ''
 
 stages:
 # =====================================================
@@ -30,10 +47,45 @@ stages:
     - job: BuildDocker
       displayName: Build and Push Docker Image
       pool:
-        vmImage: ubuntu-latest
+        name: ${{ parameters.dockerPool }}
       steps:
         - checkout: self
-          clean: true
+          fetchDepth: 0
+          submodules: true
+          persistCredentials: true
+
+        - bash: |
+            echo "=== Validating workspace structure ==="
+            echo "Current directory: $(pwd)"
+            echo "Build.SourcesDirectory: $(Build.SourcesDirectory)"
+            echo ""
+            echo "Checking docker directory..."
+            if [ -d "$(Build.SourcesDirectory)/docker" ]; then
+              echo "✓ docker directory exists"
+              ls -la "$(Build.SourcesDirectory)/docker"
+            else
+              echo "✗ docker directory NOT found"
+              exit 1
+            fi
+            echo ""
+            echo "Checking docker-entrypoint-initdb.d..."
+            if [ -d "$(Build.SourcesDirectory)/docker/docker-entrypoint-initdb.d" ]; then
+              echo "✓ docker-entrypoint-initdb.d exists"
+              ls -la "$(Build.SourcesDirectory)/docker/docker-entrypoint-initdb.d"
+            else
+              echo "✗ docker-entrypoint-initdb.d NOT found"
+              exit 1
+            fi
+            echo ""
+            echo "Checking submodules..."
+            if [ -d "$(Build.SourcesDirectory)/.github/actions" ]; then
+              echo "✓ .github/actions exists"
+              ls -la "$(Build.SourcesDirectory)/.github/actions"
+            else
+              echo "✗ .github/actions NOT found"
+            fi
+            echo "=== Workspace validation completed ==="
+          displayName: Validate Workspace Structure
 
         - bash: |
             BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -62,6 +114,7 @@ stages:
             tags: |
               $(semanticTag)
               latest
+            arguments: $(dockerBuildArgs)
 
         - task: Docker@2
           displayName: Push Docker Image
@@ -86,23 +139,73 @@ stages:
 # =====================================================
 # DEPLOY STAGE
 # =====================================================
-- stage: Deploy_blue_dev
-  displayName: Deploy to blue-dev
+# NOTE: This stage uses pwsh (PowerShell Core) for cross-platform
+# compatibility. Works on both Windows Server and Linux clients.
+#
+# Requirements:
+# - Windows agents: PowerShell 5+ (native, no installation required)
+# - Linux agents: PowerShell Core 7+ (pwsh)
+#
+# Install pwsh on Linux agents:
+#   curl -sSL https://aka.ms/install-powershell.sh | bash -s -- -mt
+#
+# For detailed documentation, see: .azuredevops/README.md
+# =====================================================
+- stage: Deploy
+  displayName: Deploy to ${{ parameters.targetEnvironment }}
   dependsOn: Build
   variables:
-    - group: blue-dev-secret   # This loads the variable named "blue-dev-secret" from Key Vault
+    - group: ${{ parameters.targetEnvironment }}-secret   # Dynamic variable group based on targetEnvironment
   
   jobs:
     - deployment: DeploySuperset
-      displayName: Deploy Superset to blue-dev
+      displayName: Deploy Superset to ${{ parameters.targetEnvironment }}
       environment:
         name: ${{ parameters.targetEnvironment }}
         resourceType: VirtualMachine
+      workspace:
+        clean: all
       strategy:
         runOnce:
           deploy:
             steps:
               - checkout: self
+                submodules: true
+
+              - pwsh: |
+                  Write-Host "=== DEBUG: Setting Working Directory ==="
+                  Write-Host "Current directory: $(Get-Location)"
+                  Write-Host "Pipeline.Workspace: $(Pipeline.Workspace)"
+                  Write-Host ""
+                  Write-Host "Changing to Pipeline.Workspace/s..."
+                  Set-Location "$(Pipeline.Workspace)/s" -ErrorAction Stop
+                  Write-Host "✓ Changed directory to: $(Get-Location)"
+                  Write-Host ""
+                  Write-Host "Contents of current directory:"
+                  Get-ChildItem -Force
+                  Write-Host ""
+                  Write-Host "=== END DEBUG ==="
+                displayName: Set Working Directory
+
+              - pwsh: |
+                  Write-Host "=== Validating deployment workspace ==="
+                  Write-Host "Pipeline.Workspace: $(Pipeline.Workspace)"
+                  Write-Host ""
+                  Write-Host "Checking docker-entrypoint-initdb.d..."
+
+                  $initDbDir = "$(Pipeline.Workspace)/s/docker/docker-entrypoint-initdb.d"
+
+                  if (Test-Path $initDbDir) {
+                    Write-Host "✓ docker-entrypoint-initdb.d exists"
+                    Get-ChildItem -Force $initDbDir
+                  } else {
+                    Write-Host "✗ docker-entrypoint-initdb.d NOT found at $(Pipeline.Workspace)/s/docker/"
+                    Write-Host "Available directories in workspace root:"
+                    Get-ChildItem -Force "$(Pipeline.Workspace)/s/"
+                    exit 1
+                  }
+                  Write-Host "=== Deployment workspace validation completed ==="
+                displayName: Validate Deployment Workspace
 
               - download: current
                 artifact: $(artifactName)
@@ -119,10 +222,13 @@ stages:
               # -------------------------------------
               # Rehydrate & validate client config
               # -------------------------------------
+              # CLIENT_CONFIG is dynamically loaded from environment-specific variable group
+              # Variable groups: blue-dev-secret, lat360foods-secret, etc.
+              # Template expression resolves to $(blue-dev-secret), $(lat360foods-secret), etc. at compile time
               - task: PowerShell@2
                 displayName: 'Rehydrate & validate client config'
                 env:
-                  CLIENT_CONFIG: $(blue-dev-secret)
+                  CLIENT_CONFIG: ${{ format('$({0}-secret)', parameters.targetEnvironment) }}
                 inputs:
                   pwsh: true
                   targetType: inline
@@ -133,7 +239,7 @@ stages:
                     $raw = $env:CLIENT_CONFIG
                     
                     if ([string]::IsNullOrEmpty($raw)) {
-                        throw "CLIENT_CONFIG (blue-dev-secret from Key Vault) is empty or not set"
+                        throw "CLIENT_CONFIG from ${{ parameters.targetEnvironment }}-secret variable group is empty or not set. Ensure the variable group exists and contains CLIENT_CONFIG variable."
                     }
                     
                     Write-Host "Retrieved config (length: $($raw.Length) chars)"
@@ -178,154 +284,410 @@ stages:
                     
                     # Extract Superset (Explorer) and Postgres info
                     $appSuite = $cfg.'app-suite'[0]
-                    
+
                     if (-not $appSuite.explorer) {
                         throw "Config missing 'explorer' section in app-suite[0]"
                     }
-                    
+
                     if (-not $appSuite.postgres) {
                         throw "Config missing 'postgres' section in app-suite[0]"
                     }
-                    
+
                     $explorer = $appSuite.explorer
                     $pg = $appSuite.postgres
-                    
+
+                    # Validate required Explorer fields
+                    $requiredExplorerFields = @('port', 'admin-user', 'admin-password')
+                    foreach ($field in $requiredExplorerFields) {
+                        if (-not $explorer.$field) {
+                            throw "Config missing required Explorer field: '$field'"
+                        }
+                    }
+
                     Write-Host "✓ Config structure validated"
-                    
+
                     # Superset (Explorer) variables
                     Write-Host "Setting Superset variables..."
                     Write-Host "  Port: $($explorer.port)"
                     Write-Host "  Admin User: $($explorer.'admin-user')"
-                    
+
                     Write-Host "##vso[task.setvariable variable=SUPERSET_PORT]$($explorer.port)"
                     Write-Host "##vso[task.setvariable variable=SUPERSET_ADMIN_USER]$($explorer.'admin-user')"
+
+                    # Extract Superset SECRET_KEY from client config
+                    $supersetSecretKey = $cfg.'superset-secret-key'
+
+                    if ([string]::IsNullOrWhiteSpace($supersetSecretKey)) {
+                        Write-Host "ERROR: superset-secret-key not found in client-config"
+                        Write-Host "ERROR: Add 'superset-secret-key' to the root of your client-config JSON"
+                        exit 1
+                    }
+
+                    Write-Host "✓ SECRET_KEY extracted from client config"
+                    Write-Host "##vso[task.setvariable variable=SUPERSET_SECRET_KEY;issecret=true]$supersetSecretKey"
+
+                    # Set admin password as pipeline variable (for deployment stage)
                     Write-Host "##vso[task.setvariable variable=SUPERSET_ADMIN_PASSWORD;issecret=true]$($explorer.'admin-password')"
-                    
-                    # Postgres variables
-                    Write-Host "Setting Postgres variables..."
-                    Write-Host "  Host: oee-postgres"
-                    Write-Host "  Port: 5432"
-                    Write-Host "  Database: $($pg.database)"
-                    Write-Host "  User: $($pg.admin.user)"
-                    
-                    Write-Host "##vso[task.setvariable variable=DB_HOST]oee-postgres"
-                    Write-Host "##vso[task.setvariable variable=DB_PORT]5432"
-                    Write-Host "##vso[task.setvariable variable=DB_NAME]$($pg.database)"
-                    Write-Host "##vso[task.setvariable variable=DB_USER]$($pg.admin.user)"
-                    Write-Host "##vso[task.setvariable variable=DB_PASSWORD;issecret=true]$($pg.admin.password)"
-                    
+                    Write-Host "✓ Admin password set as pipeline variable"
+
+                    # Write admin password to temp file (for Create .env.deploy task on build agent)
+                    $adminPasswordFile = Join-Path "$(Agent.TempDirectory)" "superset-admin-password.txt"
+                    Set-Content -Path $adminPasswordFile -Value $explorer.'admin-password' -NoNewline
+                    Write-Host "✓ Admin password written to temp file"
+
+                    # Extract PostgreSQL credentials for OEE database connection
+                    Write-Host "Extracting OEE database credentials..."
+
+                    # Use 'admin' credentials for OEE database (oee-admin user)
+                    if (-not $pg.admin) {
+                        throw "Config missing 'admin' section in postgres config"
+                    }
+                    $pgCreds = $pg.admin
+                    Write-Host "  Using 'admin' credentials from client config"
+
+                    if (-not $pgCreds.user) {
+                        throw "Config missing 'user' in postgres admin config"
+                    }
+                    if (-not $pgCreds.password) {
+                        throw "Config missing 'password' in postgres admin config"
+                    }
+
+                    # Set OEE database credentials as pipeline variables
+                    Write-Host "  OEE DB User: $($pgCreds.user)"
+                    Write-Host "##vso[task.setvariable variable=OEE_DB_USER]$($pgCreds.user)"
+                    Write-Host "##vso[task.setvariable variable=OEE_DB_PASSWORD;issecret=true]$($pgCreds.password)"
+                    Write-Host "✓ OEE database credentials set as pipeline variables"
+
+                    # Set OEE database connection details
+                    # Note: Superset runs inside Docker network, so use Docker hostname
+                    # not external host/port from client config
+                    $oeeDbHost = "oee-postgres"
+                    $oeeDbPort = "5432"
+                    $oeeDbName = if ($pg.database) { $pg.database } else { "oeeintellisuite" }
+
+                    Write-Host "##vso[task.setvariable variable=OEE_DB_HOST]$oeeDbHost"
+                    Write-Host "##vso[task.setvariable variable=OEE_DB_PORT]$oeeDbPort"
+                    Write-Host "##vso[task.setvariable variable=OEE_DB_NAME]$oeeDbName"
+                    Write-Host "✓ OEE database connection details set (using Docker network hostname)"
+
+                    # Docker network
+                    Write-Host "Setting Docker network..."
+                    Write-Host "##vso[task.setvariable variable=DOCKER_NETWORK]superset-network"
+
                     Write-Host "✓ All variables set successfully"
                     Write-Host "=== Config rehydration completed ==="
 
               # -------------------------------------
               # Load deployment artifact
               # -------------------------------------
-              - bash: |
-                  source $(Pipeline.Workspace)/$(artifactName)/deployment.env
-                  echo "##vso[task.setvariable variable=FULL_IMAGE_NAME]$FULL_IMAGE_NAME"
-                  echo "Using image: $FULL_IMAGE_NAME"
+              - pwsh: |
+                  $envFile = "$(Pipeline.Workspace)/$(artifactName)/deployment.env"
+                  Get-Content $envFile | ForEach-Object {
+                    if ($_ -match '^FULL_IMAGE_NAME=(.+)$') {
+                      $imageName = $Matches[1]
+                      Write-Host "Setting FULL_IMAGE_NAME=$imageName"
+                      Write-Host "##vso[task.setvariable variable=FULL_IMAGE_NAME]$imageName"
+                      Write-Host "Using image: $imageName"
+                    }
+                  }
                 displayName: Load Deployment Variables
+
+              - pwsh: |
+                  Write-Host "Setting DOCKER_INITDB_DIR to workspace path..."
+                  Write-Host "##vso[task.setvariable variable=DOCKER_INITDB_DIR]$(Pipeline.Workspace)/s/docker/docker-entrypoint-initdb.d"
+                  Write-Host "✓ DOCKER_INITDB_DIR set to: $(Pipeline.Workspace)/s/docker/docker-entrypoint-initdb.d"
+                displayName: Set Docker InitDB Directory Path
+
+              # -------------------------------------
+              # Debug: Print all available variables
+              # -------------------------------------
+              - pwsh: |
+                  Write-Host "=== DEBUGGING: Printing all pipeline variables ==="
+                  Write-Host ""
+                  Write-Host "Pipeline variables (Azure DevOps syntax):"
+                  Write-Host "  FULL_IMAGE_NAME: '$(FULL_IMAGE_NAME)'"
+                  Write-Host "  SUPERSET_SECRET_KEY: '***masked***'"
+                  Write-Host "  SUPERSET_ADMIN_USER: '$(SUPERSET_ADMIN_USER)'"
+                  Write-Host "  SUPERSET_PORT: '$(SUPERSET_PORT)'"
+                  Write-Host "  DOCKER_NETWORK: '$(DOCKER_NETWORK)'"
+                  Write-Host "  DOCKER_INITDB_DIR: '$(DOCKER_INITDB_DIR)'"
+                  Write-Host ""
+                  Write-Host "Environment variables in this shell:"
+                  Get-ChildItem Env: | Where-Object { $_.Name -match 'FULL_IMAGE_NAME|SUPERSET|DOCKER_NETWORK|DOCKER_INITDB_DIR' } | ForEach-Object {
+                    Write-Host "  $($_.Name)=$($_.Value)"
+                  }
+                  Write-Host ""
+                  Write-Host "=== END DEBUGGING ==="
+                displayName: Debug Variables
 
               # -------------------------------------
               # Create docker-compose env file
               # -------------------------------------
-              - bash: |
-                  echo "Creating .env.deploy file..."
-                  cat > .env.deploy << EOF
-                  SUPERSET_IMAGE=${FULL_IMAGE_NAME}
-                  
-                  SUPERSET_SECRET_KEY=${SUPERSET_SECRET_KEY}
-                  SUPERSET_ADMIN_USER=${SUPERSET_ADMIN_USER}
-                  SUPERSET_ADMIN_PASSWORD=${SUPERSET_ADMIN_PASSWORD}
-                  SUPERSET_PORT=${SUPERSET_PORT}
-                  
-                  POSTGRES_HOST=${DB_HOST}
-                  POSTGRES_PORT=${DB_PORT}
-                  POSTGRES_DB=${DB_NAME}
-                  POSTGRES_USER=${DB_USER}
-                  POSTGRES_PASSWORD=${DB_PASSWORD}
-                  
-                  REDIS_HOST=redis
-                  REDIS_PORT=6379
-                  
-                  DOCKER_NETWORK=${DOCKER_NETWORK}
-                  EOF
-                  
-                  echo "✓ Created .env.deploy file"
-                  echo ""
-                  echo "Environment variables (non-sensitive):"
-                  echo "  SUPERSET_IMAGE: ${FULL_IMAGE_NAME}"
-                  echo "  SUPERSET_PORT: ${SUPERSET_PORT}"
-                  echo "  SUPERSET_ADMIN_USER: ${SUPERSET_ADMIN_USER}"
-                  echo "  POSTGRES_HOST: ${DB_HOST}"
-                  echo "  POSTGRES_PORT: ${DB_PORT}"
-                  echo "  POSTGRES_DB: ${DB_NAME}"
-                  echo "  POSTGRES_USER: ${DB_USER}"
-                  echo "  REDIS_HOST: redis"
-                  echo "  REDIS_PORT: 6379"
-                  echo "  DOCKER_NETWORK: ${DOCKER_NETWORK}"
-                  echo ""
-                  echo "Content of .env.deploy (with secrets masked):"
-                  cat .env.deploy | sed 's/PASSWORD=.*/PASSWORD=***masked***/g' | sed 's/SECRET_KEY=.*/SECRET_KEY=***masked***/g'
+              - pwsh: |
+                  Write-Host "=== DEBUG: .env.deploy Creation ==="
+                  Write-Host "Current working directory: $(Get-Location)"
+                  Write-Host "Pipeline.Workspace: $(Pipeline.Workspace)"
+                  Write-Host ""
+                  Write-Host "Changing to deployment directory..."
+                  Set-Location "$(Pipeline.Workspace)/s" -ErrorAction Stop
+                  Write-Host "✓ Changed directory to: $(Get-Location)"
+                  Write-Host ""
+                  Write-Host "Files in current directory:"
+                  Get-ChildItem -Force
+                  Write-Host ""
+                  Write-Host "Creating .env.deploy file..."
+
+                  # Read admin password from temp file (written by PowerShell step)
+                  $adminPasswordFile = Join-Path "$(Agent.TempDirectory)" "superset-admin-password.txt"
+                  if (Test-Path $adminPasswordFile) {
+                    $SUPERSET_ADMIN_PASSWORD = Get-Content $adminPasswordFile -Raw
+                    Write-Host "✓ Read admin password from temp file"
+                  } else {
+                    Write-Host "✗ ERROR: Admin password file not found: $adminPasswordFile"
+                    exit 1
+                  }
+
+                  # Create .env.deploy file using array of lines to avoid YAML parser issues
+                  # Azure DevOps variables $(VAR) are expanded before PowerShell runs
+                  $envLines = @(
+                    "SUPERSET_IMAGE=$(FULL_IMAGE_NAME)"
+                    "SUPERSET_SECRET_KEY=$(SUPERSET_SECRET_KEY)"
+                    "SUPERSET_ADMIN_USER=$(SUPERSET_ADMIN_USER)"
+                    "SUPERSET_ADMIN_PASSWORD=$env:SUPERSET_ADMIN_PASSWORD"
+                    "SUPERSET_PORT=$(SUPERSET_PORT)"
+                    "DATABASE_DIALECT=postgresql"
+                    "DATABASE_USER=superset"
+                    "DATABASE_PASSWORD=superset"
+                    "DATABASE_HOST=db"
+                    "DATABASE_PORT=5432"
+                    "DATABASE_DB=superset"
+                    "REDIS_HOST=redis"
+                    "REDIS_PORT=6379"
+                    "DOCKER_NETWORK=$(DOCKER_NETWORK)"
+                    "DOCKER_INITDB_DIR=$(DOCKER_INITDB_DIR)"
+                  )
+                  # Use `n (LF) instead of [System.Environment]::NewLine for consistent Unix line endings
+                  # This ensures .env.deploy works correctly on Linux deployment targets
+                  $envContent = $envLines -join "`n"
+                  Set-Content -Path ".env.deploy" -Value $envContent -Encoding UTF8NoBOM
+                  Write-Host "✓ Created .env.deploy file"
+                  Write-Host ""
+                  Write-Host ".env.deploy file location:"
+                  Get-ChildItem -Force ".env.deploy"
+                  Write-Host ""
+                  Write-Host "=== DEBUG: Variable value lengths ==="
+                  Write-Host "SUPERSET_SECRET_KEY length: $env:SUPERSET_SECRET_KEY.Length"
+                  Write-Host "SUPERSET_ADMIN_USER length: $env:SUPERSET_ADMIN_USER.Length"
+                  Write-Host "SUPERSET_ADMIN_PASSWORD length: $env:SUPERSET_ADMIN_PASSWORD.Length"
+                  Write-Host "SUPERSET_PORT length: $env:SUPERSET_PORT.Length"
+                  Write-Host ""
+                  if ([string]::IsNullOrWhiteSpace($env:SUPERSET_SECRET_KEY)) {
+                    Write-Host "✗ ERROR: SUPERSET_SECRET_KEY is empty!"
+                    exit 1
+                  }
+                  if ([string]::IsNullOrWhiteSpace($env:SUPERSET_ADMIN_PASSWORD)) {
+                    Write-Host "✗ ERROR: SUPERSET_ADMIN_PASSWORD is empty!"
+                    exit 1
+                  }
+                  Write-Host "✓ All required variables have values"
+                  Write-Host ""
+                  Write-Host "Environment variables (non-sensitive):"
+                  Write-Host "  SUPERSET_IMAGE: $(FULL_IMAGE_NAME)"
+                  Write-Host "  SUPERSET_PORT: $(SUPERSET_PORT)"
+                  Write-Host "  DATABASE_DIALECT: postgresql"
+                  Write-Host "  DATABASE_USER: superset"
+                  Write-Host "  DATABASE_HOST: db"
+                  Write-Host "  DATABASE_PORT: 5432"
+                  Write-Host "  DATABASE_DB: superset"
+                  Write-Host "  REDIS_HOST: redis"
+                  Write-Host "  REDIS_PORT: 6379"
+                  Write-Host "  DOCKER_NETWORK: $(DOCKER_NETWORK)"
+                  Write-Host "  DOCKER_INITDB_DIR: $(DOCKER_INITDB_DIR)"
+                  Write-Host ""
+                  Write-Host "Superset admin credentials:"
+                  Write-Host "  SUPERSET_ADMIN_USER: ***configured***"
+                  Write-Host "  SUPERSET_ADMIN_PASSWORD: ***configured***"
+                  Write-Host ""
+                  Write-Host "Content of .env.deploy (with secrets masked):"
+                  $maskedContent = Get-Content ".env.deploy" -Raw
+                  $maskedContent = $maskedContent -replace 'PASSWORD=.*', 'PASSWORD=***masked***' -replace 'SECRET_KEY=.*', 'SECRET_KEY=***masked***'
+                  Write-Host $maskedContent
+                  Write-Host ""
+                  Write-Host "=== END DEBUG ==="
                 env:
                   FULL_IMAGE_NAME: $(FULL_IMAGE_NAME)
                   SUPERSET_SECRET_KEY: $(SUPERSET_SECRET_KEY)
                   SUPERSET_ADMIN_USER: $(SUPERSET_ADMIN_USER)
                   SUPERSET_ADMIN_PASSWORD: $(SUPERSET_ADMIN_PASSWORD)
                   SUPERSET_PORT: $(SUPERSET_PORT)
-                  DB_HOST: $(DB_HOST)
-                  DB_PORT: $(DB_PORT)
-                  DB_NAME: $(DB_NAME)
-                  DB_USER: $(DB_USER)
-                  DB_PASSWORD: $(DB_PASSWORD)
                   DOCKER_NETWORK: $(DOCKER_NETWORK)
+                  DOCKER_INITDB_DIR: $(DOCKER_INITDB_DIR)
                 displayName: Create .env.deploy
+
+              # -------------------------------------
+              # Cleanup old containers (NOT volumes - data is preserved)
+              # -------------------------------------
+              - pwsh: |
+                  Write-Host "=== Cleaning up old containers (preserving volumes) ==="
+                  Set-Location "$(Pipeline.Workspace)/s" -ErrorAction Stop
+
+                  Write-Host "Stopping and removing existing containers by name..."
+                  docker rm -f superset_db superset_cache superset_init superset_app 2>$null; if ($LASTEXITCODE -ne 0) { Write-Host "No named containers to remove" }
+
+                  Write-Host "Stopping docker-compose project containers (without removing volumes)..."
+                  docker compose -f .azuredevops/docker-compose-deploy.yml --env-file .env.deploy --project-name azuredevops down 2>$null; if ($LASTEXITCODE -ne 0) { Write-Host "No project containers to stop" }
+
+                  Write-Host "✓ Cleanup completed (volumes preserved)"
+                  Write-Host ""
+                displayName: Cleanup Old Containers
 
               # -------------------------------------
               # Deploy Superset
               # -------------------------------------
-              - bash: |
-                  echo "Deploying Superset with docker-compose..."
-                  echo "Loading environment variables from .env.deploy..."
-                  set -a  # Automatically export all variables
-                  source .env.deploy
-                  set +a
-                  echo ""
-                  echo "Checking shell environment:"
-                  env | grep -E "SUPERSET|DATABASE|POSTGRES|REDIS|DOCKER_NETWORK" | sort
-                  
-                  docker compose -f docker-compose-deploy.yml --env-file .env.deploy up -d
-                  
-                  echo ""
-                  echo "✓ Deployment completed"
-                  echo ""
-                  echo "Running containers:"
-                  docker compose -f docker-compose-deploy.yml ps
+              - pwsh: |
+                  Write-Host "=== DEBUG: Deploy Superset ==="
+                  Write-Host "Current working directory: $(Get-Location)"
+                  Write-Host "Pipeline.Workspace: $(Pipeline.Workspace)"
+                  Write-Host ""
+                  Write-Host "Changing to deployment directory..."
+                  Set-Location "$(Pipeline.Workspace)/s" -ErrorAction Stop
+                  Write-Host "✓ Changed directory to: $(Get-Location)"
+                  Write-Host ""
+
+                  # Recreate .env.deploy file on deployment target
+                  # (previous .env.deploy was on build agent, this is on deployment VM)
+                  Write-Host "Creating .env.deploy file..."
+
+                  # SUPERSET_ADMIN_PASSWORD is now available via env: block from pipeline variable
+
+                  # Build .env.deploy content line by line to avoid YAML parser issues with here-strings
+                  # Azure DevOps variables $(VAR) are expanded before PowerShell runs
+                  # Environment variables accessed via $env:VAR are expanded by PowerShell
+                  $envLines = @(
+                    "SUPERSET_IMAGE=$(FULL_IMAGE_NAME)"
+                    "SUPERSET_SECRET_KEY=$(SUPERSET_SECRET_KEY)"
+                    "SUPERSET_ADMIN_USER=$(SUPERSET_ADMIN_USER)"
+                    "SUPERSET_ADMIN_PASSWORD=$env:SUPERSET_ADMIN_PASSWORD"
+                    "SUPERSET_PORT=$(SUPERSET_PORT)"
+                    "DATABASE_DIALECT=postgresql"
+                    "DATABASE_USER=superset"
+                    "DATABASE_PASSWORD=superset"
+                    "DATABASE_HOST=db"
+                    "DATABASE_PORT=5432"
+                    "DATABASE_DB=superset"
+                    "REDIS_HOST=redis"
+                    "REDIS_PORT=6379"
+                    "DOCKER_NETWORK=$(DOCKER_NETWORK)"
+                    "DOCKER_INITDB_DIR=$(DOCKER_INITDB_DIR)"
+                  )
+                  # Use `n (LF) instead of [System.Environment]::NewLine for consistent Unix line endings
+                  # This ensures .env.deploy works correctly on Linux deployment targets
+                  $envContent = $envLines -join "`n"
+                  Set-Content -Path ".env.deploy" -Value $envContent -Encoding UTF8NoBOM
+                  Write-Host "✓ Created .env.deploy file"
+                  Write-Host ""
+                  Write-Host "Checking .env.deploy content (secrets masked):"
+                  $maskedContent = Get-Content ".env.deploy" -Raw
+                  $maskedContent = $maskedContent -replace 'PASSWORD=.*', 'PASSWORD=***masked***' -replace 'SECRET_KEY=.*', 'SECRET_KEY=***masked***'
+                  Write-Host $maskedContent
+                  Write-Host ""
+
+                  Write-Host "Deploying with docker-compose..."
+                  docker compose -f .azuredevops/docker-compose-deploy.yml --env-file .env.deploy --project-name azuredevops up -d
+
+                  Write-Host ""
+                  Write-Host "✓ Deployment completed"
+                  Write-Host ""
+                  Write-Host "Running containers:"
+                  docker ps --filter "name=azuredevops" --format "table {{.Names}}`t{{.Status}}`t{{.Ports}}"
+                  Write-Host ""
+                  Write-Host "=== END DEBUG ==="
+                env:
+                  FULL_IMAGE_NAME: $(FULL_IMAGE_NAME)
+                  SUPERSET_SECRET_KEY: $(SUPERSET_SECRET_KEY)
+                  SUPERSET_ADMIN_USER: $(SUPERSET_ADMIN_USER)
+                  SUPERSET_ADMIN_PASSWORD: $(SUPERSET_ADMIN_PASSWORD)
+                  SUPERSET_PORT: $(SUPERSET_PORT)
+                  DOCKER_NETWORK: $(DOCKER_NETWORK)
+                  DOCKER_INITDB_DIR: $(DOCKER_INITDB_DIR)
                 displayName: Deploy Superset
 
               # -------------------------------------
               # Health check
               # -------------------------------------
-              - bash: |
-                  echo "Starting health check for Superset on port ${SUPERSET_PORT}..."
-                  echo ""
-                  
-                  for i in {1..60}; do
-                    if curl -fs http://localhost:${SUPERSET_PORT}/health; then
-                      echo ""
-                      echo "✓ Superset is healthy and responding"
+              - pwsh: |
+                  Write-Host "=== DEBUG: Verify Health ==="
+                  Write-Host "Current working directory: $(Get-Location)"
+                  Write-Host "Changing to deployment directory..."
+                  Set-Location "$(Pipeline.Workspace)/s" -ErrorAction Stop
+                  Write-Host "✓ Changed directory to: $(Get-Location)"
+                  Write-Host ""
+                  Write-Host "Starting health check for Superset on port $(SUPERSET_PORT)..."
+                  Write-Host ""
+
+                  # First check if containers are running
+                  Write-Host "Checking container status..."
+                  docker ps --filter "name=azuredevops" --format "table {{.Names}}`t{{.Status}}"
+                  Write-Host ""
+
+                  for ($i = 1; $i -le 60; $i++) {
+                    $healthUrl = "http://localhost:$(SUPERSET_PORT)/health"
+                    try {
+                      $response = Invoke-WebRequest -Uri $healthUrl -UseBasicParsing -TimeoutSec 5
+                      Write-Host ""
+                      Write-Host "✓ Superset is healthy and responding"
                       exit 0
-                    fi
-                    echo "Attempt $i/60: Waiting for Superset to be ready..."
-                    sleep 10
-                  done
-                  
-                  echo ""
-                  echo "✗ Superset failed health check after 10 minutes"
-                  echo ""
-                  echo "Container logs:"
-                  docker compose -f docker-compose-deploy.yml logs --tail=50
+                    } catch {
+                      Write-Host "Attempt $i/60: Waiting for Superset to be ready..."
+                      Start-Sleep -Seconds 10
+                    }
+                  }
+
+                  Write-Host ""
+                  Write-Host "✗ Superset failed health check after 10 minutes"
+                  Write-Host ""
+                  Write-Host "Container logs:"
+                  docker compose -f .azuredevops/docker-compose-deploy.yml --env-file .env.deploy --project-name azuredevops logs --tail=50
                   exit 1
                 env:
                   SUPERSET_PORT: $(SUPERSET_PORT)
                 displayName: Verify Health
+
+              # -------------------------------------
+              # Update Superset OEE database connection
+              # -------------------------------------
+              - pwsh: |
+                  Write-Host "=== Updating Superset OEE Database Connection ==="
+                  Set-Location "$(Pipeline.Workspace)/s" -ErrorAction Stop
+
+                  $scriptPath = ".azuredevops/scripts/Update-SupersetDatabaseConnection.ps1"
+
+                  Write-Host "Running script: $scriptPath"
+                  Write-Host "  OEE_DB_HOST: $(OEE_DB_HOST)"
+                  Write-Host "  OEE_DB_PORT: $(OEE_DB_PORT)"
+                  Write-Host "  OEE_DB_NAME: $(OEE_DB_NAME)"
+                  Write-Host "  OEE_DB_USER: $(OEE_DB_USER)"
+                  Write-Host ""
+
+                  & pwsh -File $scriptPath `
+                    -OEE_DB_HOST "$(OEE_DB_HOST)" `
+                    -OEE_DB_PORT "$(OEE_DB_PORT)" `
+                    -OEE_DB_NAME "$(OEE_DB_NAME)" `
+                    -OEE_DB_USER "$(OEE_DB_USER)" `
+                    -OEE_DB_PASSWORD "$(OEE_DB_PASSWORD)"
+
+                  if ($LASTEXITCODE -eq 0) {
+                    Write-Host ""
+                    Write-Host "✓ OEE database connection configured successfully"
+                  } else {
+                    Write-Host ""
+                    Write-Host "✗ Failed to configure OEE database connection"
+                    exit 1
+                  }
+                env:
+                  OEE_DB_HOST: $(OEE_DB_HOST)
+                  OEE_DB_PORT: $(OEE_DB_PORT)
+                  OEE_DB_NAME: $(OEE_DB_NAME)
+                  OEE_DB_USER: $(OEE_DB_USER)
+                  OEE_DB_PASSWORD: $(OEE_DB_PASSWORD)
+                displayName: Update OEE Database Connection
